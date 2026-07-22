@@ -700,6 +700,166 @@ else
     fi
 fi
 
+# Agent-Sandbox Upgrade Test
+if [ $TEST_FAILED -eq 0 ] && [ "${AGENT_SANDBOX_VERSION}" = "v0.4.6" ]; then
+    echo "Running Agent-Sandbox Upgrade Test (v0.4.6 -> v0.5.2)..."
+    UPGRADE_FAILED=0
+    NEW_VERSION="v0.5.2"
+    
+    echo "1. Creating the first CodeInterpreter claim (warm adoption under v0.4.6)..."
+    cat <<EOF | kubectl apply -n "${WORKLOAD_NAMESPACE}" -f -
+apiVersion: runtime.agentcube.volcano.sh/v1alpha1
+kind: CodeInterpreter
+metadata:
+  name: upgrade-ci-1
+spec:
+  warmPoolSize: 1
+  minReplicas: 0
+  maxReplicas: 2
+EOF
+    
+    echo "Waiting for upgrade-ci-1's SandboxClaim to become Bound..."
+    SB_CLAIM_NAME=""
+    for i in {1..30}; do
+        SB_CLAIM_NAME=$(kubectl get sandboxclaim -n "${WORKLOAD_NAMESPACE}" -o json | jq -r '.items[] | select(.metadata.ownerReferences[0].name=="upgrade-ci-1") | .metadata.name' 2>/dev/null || true)
+        if [ -n "$SB_CLAIM_NAME" ]; then
+            if kubectl get sandboxclaim "$SB_CLAIM_NAME" -n "${WORKLOAD_NAMESPACE}" | grep -q Bound; then
+                break
+            fi
+        fi
+        sleep 2
+    done
+    
+    if [ -z "$SB_CLAIM_NAME" ] || ! kubectl get sandboxclaim "$SB_CLAIM_NAME" -n "${WORKLOAD_NAMESPACE}" | grep -q Bound; then
+        echo "Error: upgrade-ci-1's SandboxClaim did not become Bound."
+        UPGRADE_FAILED=1
+    fi
+    
+    if [ $UPGRADE_FAILED -eq 0 ]; then
+        echo "2. Capturing Sandbox and Pod UIDs for upgrade-ci-1..."
+        SB_NAME=$(kubectl get sandboxclaim "${SB_CLAIM_NAME}" -n "${WORKLOAD_NAMESPACE}" -o jsonpath='{.status.sandboxName}')
+        SB_UID=$(kubectl get sandbox "${SB_NAME}" -n "${WORKLOAD_NAMESPACE}" -o jsonpath='{.metadata.uid}')
+        POD_UID=$(kubectl get pod "${SB_NAME}-0" -n "${WORKLOAD_NAMESPACE}" -o jsonpath='{.metadata.uid}')
+        
+        echo "Captured UIDs -> Sandbox: ${SB_UID}, Pod: ${POD_UID}"
+        
+        echo "3. Stopping the old agent-sandbox controller to simulate upgrade downtime..."
+        kubectl scale deployment agent-sandbox-controller -n agent-sandbox-system --replicas=0
+        
+        echo "4. Creating the second CodeInterpreter claim (remains Unbound)..."
+        cat <<EOF | kubectl apply -n "${WORKLOAD_NAMESPACE}" -f -
+apiVersion: runtime.agentcube.volcano.sh/v1alpha1
+kind: CodeInterpreter
+metadata:
+  name: upgrade-ci-2
+spec:
+  warmPoolSize: 1
+  minReplicas: 0
+  maxReplicas: 2
+EOF
+        
+        echo "Waiting for upgrade-ci-2's SandboxClaim to be created..."
+        SB_CLAIM_2_NAME=""
+        for i in {1..15}; do
+            SB_CLAIM_2_NAME=$(kubectl get sandboxclaim -n "${WORKLOAD_NAMESPACE}" -o json | jq -r '.items[] | select(.metadata.ownerReferences[0].name=="upgrade-ci-2") | .metadata.name' 2>/dev/null || true)
+            if [ -n "$SB_CLAIM_2_NAME" ]; then
+                break
+            fi
+            sleep 2
+        done
+        
+        if [ -z "$SB_CLAIM_2_NAME" ]; then
+            echo "Error: upgrade-ci-2's SandboxClaim was not created."
+            UPGRADE_FAILED=1
+        elif kubectl get sandboxclaim "$SB_CLAIM_2_NAME" -n "${WORKLOAD_NAMESPACE}" | grep -q Bound; then
+            echo "Error: upgrade-ci-2 became Bound, but the sandbox controller was supposed to be stopped!"
+            UPGRADE_FAILED=1
+        fi
+    fi
+    
+    if [ $UPGRADE_FAILED -eq 0 ]; then
+        echo "5. Downloading migration script and running pre-upgrade bootstrap..."
+        MIGRATE_SCRIPT="/tmp/migrate.sh"
+        curl -sL "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${NEW_VERSION}/migrate.sh" -o "${MIGRATE_SCRIPT}"
+        chmod +x "${MIGRATE_SCRIPT}"
+        "${MIGRATE_SCRIPT}" --phase=bootstrap || UPGRADE_FAILED=1
+    fi
+    
+    if [ $UPGRADE_FAILED -eq 0 ]; then
+        echo "6. Upgrading agent-sandbox to ${NEW_VERSION} (which scales controller back up)..."
+        kubectl apply --server-side -f "https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${NEW_VERSION}/sandbox-with-extensions.yaml" || UPGRADE_FAILED=1
+    fi
+    
+    if [ $UPGRADE_FAILED -eq 0 ]; then
+        echo "7. Waiting for new controller readiness..."
+        kubectl rollout status deployment/agent-sandbox-controller -n agent-sandbox-system --timeout=120s || UPGRADE_FAILED=1
+    fi
+    
+    if [ $UPGRADE_FAILED -eq 0 ]; then
+        echo "8. Running post-upgrade migration..."
+        "${MIGRATE_SCRIPT}" --phase=migrate || UPGRADE_FAILED=1
+    fi
+    
+    if [ $UPGRADE_FAILED -eq 0 ]; then
+        echo "9. Verifying UIDs of upgrade-ci-1 are preserved..."
+        NEW_SB_UID=$(kubectl get sandbox "${SB_NAME}" -n "${WORKLOAD_NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        NEW_POD_UID=$(kubectl get pod "${SB_NAME}-0" -n "${WORKLOAD_NAMESPACE}" -o jsonpath='{.metadata.uid}' 2>/dev/null)
+        
+        if [ "${NEW_SB_UID}" != "${SB_UID}" ] || [ "${NEW_POD_UID}" != "${POD_UID}" ]; then
+            echo "Error: UIDs changed! Sandbox: ${SB_UID} -> ${NEW_SB_UID}, Pod: ${POD_UID} -> ${NEW_POD_UID}"
+            UPGRADE_FAILED=1
+        else
+            echo "Success: UIDs preserved."
+        fi
+    fi
+    
+    if [ $UPGRADE_FAILED -eq 0 ]; then
+        echo "10. Verifying upgrade-ci-2 becomes Bound via shadow pool..."
+        for i in {1..60}; do
+            if kubectl get sandboxclaim "$SB_CLAIM_2_NAME" -n "${WORKLOAD_NAMESPACE}" | grep -q Bound; then
+                break
+            fi
+            sleep 2
+        done
+        if ! kubectl get sandboxclaim "$SB_CLAIM_2_NAME" -n "${WORKLOAD_NAMESPACE}" | grep -q Bound; then
+            echo "Error: upgrade-ci-2 did not become Bound after upgrade."
+            UPGRADE_FAILED=1
+        fi
+    fi
+    
+    if [ $UPGRADE_FAILED -eq 0 ]; then
+        echo "11. Deleting upgrade-ci-1 and verifying garbage collection..."
+        kubectl delete codeinterpreter upgrade-ci-1 -n "${WORKLOAD_NAMESPACE}"
+        
+        # Verify Sandbox and Pod disappear
+        echo "Waiting for Sandbox and Pod to be GC'd..."
+        GC_FAILED=0
+        for i in {1..30}; do
+            if ! kubectl get pod "${SB_NAME}-0" -n "${WORKLOAD_NAMESPACE}" 2>/dev/null && \
+               ! kubectl get sandbox "${SB_NAME}" -n "${WORKLOAD_NAMESPACE}" 2>/dev/null; then
+                GC_FAILED=0
+                break
+            fi
+            GC_FAILED=1
+            sleep 2
+        done
+        
+        if [ $GC_FAILED -eq 1 ]; then
+            echo "Error: Sandbox/Pod for upgrade-ci-1 were not garbage collected."
+            UPGRADE_FAILED=1
+        fi
+    fi
+
+    if [ $UPGRADE_FAILED -eq 0 ]; then
+        echo "12. Cleaning up..."
+        kubectl delete codeinterpreter upgrade-ci-2 -n "${WORKLOAD_NAMESPACE}" || true
+        echo "Upgrade test completed successfully!"
+    else
+        echo "Upgrade test failed!"
+        TEST_FAILED=1
+    fi
+fi
+
 # Collect logs if tests failed
 if [ $TEST_FAILED -eq 1 ]; then
     echo "Tests failed, collecting component logs..."
